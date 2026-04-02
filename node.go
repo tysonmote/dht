@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/consul/api"
@@ -55,6 +56,7 @@ type Node struct {
 	checkServer   *http.Server
 
 	// Hash table
+	mu        sync.RWMutex
 	hashTable *rendezvous.Table
 	waitIndex uint64
 
@@ -128,7 +130,11 @@ func (n *Node) poll() {
 // update blocks until the service list changes or until the Consul agent's
 // timeout is reached (10 minutes by default).
 func (n *Node) update() (err error) {
-	opts := &api.QueryOptions{WaitIndex: n.waitIndex}
+	n.mu.Lock()
+	waitIndex := n.waitIndex
+	n.mu.Unlock()
+
+	opts := &api.QueryOptions{WaitIndex: waitIndex}
 	serviceEntries, meta, err := n.consul.Health().Service(n.serviceName, "", true, opts)
 	if err != nil {
 		return err
@@ -139,15 +145,31 @@ func (n *Node) update() (err error) {
 		ids[i] = entry.Service.ID
 	}
 
+	n.mu.Lock()
 	n.hashTable = rendezvous.New(ids)
 	n.waitIndex = meta.LastIndex
+	n.mu.Unlock()
 
 	return nil
+}
+
+// refresh loads the latest service list from Consul, ignoring the current
+// blocking-query index. It is safe to call while the poll loop is running.
+func (n *Node) refresh() error {
+	n.mu.Lock()
+	n.waitIndex = 0
+	n.mu.Unlock()
+	return n.update()
 }
 
 // Member returns true if the given key belongs to this Node in the distributed
 // hash table.
 func (n *Node) Member(key string) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.hashTable == nil {
+		return false
+	}
 	return n.hashTable.Get(key) == n.serviceID
 }
 
