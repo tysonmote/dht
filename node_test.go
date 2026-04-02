@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
@@ -9,9 +10,8 @@ import (
 	"github.com/stvp/tempconsul"
 )
 
-func apiClient() (client *api.Client) {
-	client, _ = api.NewClient(api.DefaultConfig())
-	return client
+func apiClient() (*api.Client, error) {
+	return api.NewClient(api.DefaultConfig())
 }
 
 func startConsul() (server *tempconsul.Server, err error) {
@@ -20,7 +20,11 @@ func startConsul() (server *tempconsul.Server, err error) {
 }
 
 func servicesCount(name string) (count int, err error) {
-	services, _, err := apiClient().Catalog().Service(name, "", nil)
+	client, err := apiClient()
+	if err != nil {
+		return 0, err
+	}
+	services, _, err := client.Catalog().Service(name, "", nil)
 	return len(services), err
 }
 
@@ -65,6 +69,11 @@ func TestJoinLeave(t *testing.T) {
 	if count != 0 {
 		t.Errorf("expected 0 service registered, got %d", count)
 	}
+
+	// Idempotent Leave
+	if err := node.Leave(); err != nil {
+		t.Errorf("second Leave: %v", err)
+	}
 }
 
 func TestMember(t *testing.T) {
@@ -87,28 +96,25 @@ func TestMember(t *testing.T) {
 	// to run all checks so that all services are "passing".
 	time.Sleep(checkInterval * 2)
 	for _, node := range nodes {
-		node.waitIndex = 0
-		node.update()
+		if err := node.refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	tests := []struct {
-		key    string
-		member []bool
-	}{
-		{"", []bool{true, false, false}},
-		{"a", []bool{true, false, false}},
-		{"b", []bool{false, false, true}},
-		{"d9edf13e917c4f0f66be0e80cc30060e", []bool{false, true, false}},
-		{"a2a9538886f1df96be9e5b52b14b404a", []bool{false, false, true}},
+	keys := []string{"", "a", "b", "d9edf13e917c4f0f66be0e80cc30060e", "a2a9538886f1df96be9e5b52b14b404a"}
+	for k := 0; k < 50; k++ {
+		keys = append(keys, strconv.Itoa(k))
 	}
 
-	for _, test := range tests {
-		for i, node := range nodes {
-			expect := test.member[i]
-			got := node.Member(test.key)
-			if got != expect {
-				t.Errorf("nodes[%d].Member(%#v): expected %v, got %v", i, test.key, expect, got)
+	for _, key := range keys {
+		var owners int
+		for _, node := range nodes {
+			if node.Member(key) {
+				owners++
 			}
+		}
+		if owners != 1 {
+			t.Errorf("Member(%#v): want exactly one owner among 3 nodes, got %d", key, owners)
 		}
 	}
 
