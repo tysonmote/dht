@@ -3,6 +3,7 @@ package dht
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -74,6 +75,54 @@ func TestJoinLeave(t *testing.T) {
 	if err := node.Leave(); err != nil {
 		t.Errorf("second Leave: %v", err)
 	}
+}
+
+func TestJoinContextCanceled(t *testing.T) {
+	server, err := startConsul()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Term()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = JoinContext(ctx, "test", "canceled")
+	if err == nil {
+		t.Fatal("JoinContext with canceled context: expected error")
+	}
+}
+
+func TestMemberConcurrent(t *testing.T) {
+	server, err := startConsul()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Term()
+
+	node, err := Join("test", "solo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Leave()
+
+	time.Sleep(checkInterval * 2)
+	if err := node.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				_ = node.Member(strconv.Itoa(i))
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestMember(t *testing.T) {
