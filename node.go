@@ -21,6 +21,21 @@ const (
 	errorRetryWait = 200 * time.Millisecond
 )
 
+// JoinOption configures Join and JoinContext.
+type JoinOption func(*joinOptions)
+
+type joinOptions struct {
+	logger *log.Logger
+}
+
+// WithLogger causes the node to write background poll errors to l instead of
+// the standard log package.
+func WithLogger(l *log.Logger) JoinOption {
+	return func(o *joinOptions) {
+		o.logger = l
+	}
+}
+
 func newCheckListenerAndServer() (listener net.Listener, server *http.Server, err error) {
 	listener, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -47,7 +62,7 @@ func newCheckListenerAndServer() (listener net.Listener, server *http.Server, er
 // changes when a Node fails or otherwise leaves the hash table.
 //
 // Errors encountered when making blocking GET requests to the Consul agent API
-// are logged using the log package.
+// are logged using the log package, or the logger passed via WithLogger.
 //
 // Member is safe to call from multiple goroutines concurrently with the
 // background poll that refreshes table state.
@@ -69,13 +84,30 @@ type Node struct {
 	// Graceful shutdown
 	stop      chan struct{}
 	leaveOnce sync.Once
+
+	logger *log.Logger
 }
 
 // Join creates a new Node and adds it to the distributed hash table specified
 // by the given name. The given id should be unique among all Nodes in the hash
-// table.
-func Join(name, id string) (node *Node, err error) {
+// table. It is equivalent to JoinContext(context.Background(), name, id).
+func Join(name, id string, opts ...JoinOption) (node *Node, err error) {
+	return JoinContext(context.Background(), name, id, opts...)
+}
+
+// JoinContext is like Join but uses ctx for the initial service registration
+// and the first blocking fetch of healthy instances. If ctx is canceled or times
+// out before JoinContext returns, partial setup is rolled back. After a
+// successful return, the background poll is not tied to ctx; use Leave to stop
+// the node.
+func JoinContext(ctx context.Context, name, id string, opts ...JoinOption) (node *Node, err error) {
+	var jo joinOptions
+	for _, opt := range opts {
+		opt(&jo)
+	}
+
 	node = &Node{
+		logger:      jo.logger,
 		serviceName: name,
 		serviceID:   id,
 		stop:        make(chan struct{}),
@@ -91,12 +123,12 @@ func Join(name, id string) (node *Node, err error) {
 		return nil, fmt.Errorf("dht: can't start HTTP server: %s", err)
 	}
 
-	if err = node.register(context.Background()); err != nil {
+	if err = node.register(ctx); err != nil {
 		node.closeCheckServer(true)
 		return nil, fmt.Errorf("dht: can't register %s service: %s", node.serviceName, err)
 	}
 
-	if err = node.update(context.Background()); err != nil {
+	if err = node.update(ctx); err != nil {
 		_ = node.consul.Agent().ServiceDeregister(node.serviceID)
 		node.closeCheckServer(true)
 		return nil, fmt.Errorf("dht: can't fetch %s services list: %s", node.serviceName, err)
@@ -152,7 +184,7 @@ func (n *Node) poll() {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			log.Printf("[dht %s %s] error: %s", n.serviceName, n.serviceID, err)
+			n.logf("[dht %s %s] error: %s", n.serviceName, n.serviceID, err)
 			select {
 			case <-n.stop:
 				return
@@ -205,22 +237,34 @@ func (n *Node) Member(key string) bool {
 }
 
 // Leave removes the Node from the distributed hash table by de-registering it
-// from Consul. It is safe to call Leave more than once; only the first call
-// performs work. Once Leave is called, the Node should be discarded.
+// from Consul. It is equivalent to LeaveContext(context.Background()).
+func (n *Node) Leave() error {
+	return n.LeaveContext(context.Background())
+}
+
+// LeaveContext is like Leave but uses ctx for the Consul deregistration request.
+// It is safe to call more than once; only the first call performs work.
 //
-// The error from the first Leave is returned only once: the first successful
-// Leave returns nil; if deregistration fails, that error is returned from the
-// first Leave and later Leave calls return nil.
-func (n *Node) Leave() (leaveErr error) {
+// If deregistration fails on the first call, that error is returned and later
+// calls return nil.
+func (n *Node) LeaveContext(ctx context.Context) (leaveErr error) {
 	n.leaveOnce.Do(func() {
 		close(n.stop)
 
-		if err := n.consul.Agent().ServiceDeregisterOpts(n.serviceID, (&api.QueryOptions{}).WithContext(context.Background())); err != nil {
+		if err := n.consul.Agent().ServiceDeregisterOpts(n.serviceID, (&api.QueryOptions{}).WithContext(ctx)); err != nil {
 			leaveErr = err
 		}
 		n.closeCheckServer(false)
 	})
 	return leaveErr
+}
+
+func (n *Node) logf(format string, v ...interface{}) {
+	if n.logger != nil {
+		n.logger.Printf(format, v...)
+		return
+	}
+	log.Printf(format, v...)
 }
 
 // refresh resets the Consul blocking index and runs one immediate update. It is

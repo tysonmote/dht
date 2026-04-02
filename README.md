@@ -6,11 +6,21 @@ nodes. Because it uses rendezvous hashing to determine key placement, removing a
 node from the hash table is minimally disruptive in terms of key re-assignment.
 
 Local hash table state is refreshed in a background goroutine using blocking
-Consul API queries with the [default consistency mode][consul_api]. Errors
-encountered in the background goroutine are logged using the `log` package in
-the following format:
+Consul API queries with the [default consistency mode][consul_api]. There is no
+fixed delay between polls: each iteration issues one blocking query until the
+service index changes or the agent long-poll timeout is reached. After a failed
+query (for example a transient network error), the loop waits briefly before
+retrying.
+
+Errors from the background poll are logged with the `log` package in this form:
 
     [dht <name> <id>] error: <error message>
+
+Pass `WithLogger` to `Join` or `JoinContext` to send those lines to a different
+`log.Logger`.
+
+`Member` may be called from multiple goroutines at the same time as the
+background refresh.
 
 `dht` requires a locally-running Consul agent (version 0.5.2 or newer) with its
 HTTP API listening on `127.0.0.1:8500`. `dht` nodes run a simple HTTP server on
@@ -33,3 +43,18 @@ node2.Member("some_key") // false
 err = node1.Leave()
 err = node2.Leave()
 ```
+
+Use `JoinContext` for a timeout or cancellation on registration and the initial
+service list fetch; use `LeaveContext` to bound deregistration. After `Join`
+returns, ongoing polling is stopped with `Leave` / `LeaveContext`, not by
+canceling the join context.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+node, err := dht.JoinContext(ctx, "worker", "worker-1")
+```
+
+When no passing instances exist for the service, rendezvous hashing yields no
+owner: every node’s `Member` returns false for all keys until at least one
+instance is healthy.
